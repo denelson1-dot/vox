@@ -180,13 +180,26 @@ func (c *Command) Check() error {
 	if _, err := exec.LookPath(c.p.Command[0]); err != nil {
 		return fmt.Errorf("%s is not on PATH", c.p.Command[0])
 	}
-	if c.p.Model != "" {
-		m := resolveModel(c.p.Model)
-		if _, err := os.Stat(m); err != nil {
-			return fmt.Errorf("model %s not found", m)
-		}
+	if c.p.Model != "" && !modelPresent(c.p.Model) {
+		return fmt.Errorf("model %q not found in %s", c.p.Model, ModelDir())
 	}
 	return nil
+}
+
+// modelPresent reports whether a model is available, accepting both layouts
+// that engines actually use.
+//
+// A literal path or directory is the simple case. faster-whisper instead takes
+// a repository name and stores it in HuggingFace cache layout, so "base.en"
+// lives at "models--Systran--faster-whisper-base.en". Checking only for a
+// literal path would report a perfectly good model as missing, which is worse
+// than not checking at all.
+func modelPresent(model string) bool {
+	if _, err := os.Stat(resolveModel(model)); err == nil {
+		return true
+	}
+	matches, _ := filepath.Glob(filepath.Join(ModelDir(), "models--*"+model))
+	return len(matches) > 0
 }
 
 // Transcribe runs the engine over one audio file.
