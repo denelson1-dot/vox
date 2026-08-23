@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Transcribe one audio file with faster-whisper, for vox.
+
+vox drives every speech engine as an external command, so adding an engine
+means writing a script like this rather than changing vox. This one is shipped
+because faster-whisper is what a lot of people already have working.
+
+The interpreter is resolved at runtime rather than hardcoded in the shebang:
+a shebang pointing at one person's virtualenv is exactly the kind of thing
+that makes a tool unshareable.
+
+Usage:  vox-faster-whisper MODEL AUDIO
+"""
+
+import os
+import sys
+
+
+def find_interpreter():
+    """Return a Python that has faster-whisper, re-execing into it if needed."""
+    try:
+        import faster_whisper  # noqa: F401
+        return None
+    except ImportError:
+        pass
+
+    candidates = []
+    if venv := os.environ.get("VOX_WHISPER_VENV"):
+        candidates.append(os.path.join(venv, "bin", "python"))
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, ".local/share/vox/venv/bin/python"),
+        # Reuse an existing install rather than demanding a second one.
+        os.path.join(home, ".local/share/voice-dictation/venv/bin/python"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit("usage: vox-faster-whisper MODEL AUDIO")
+    model_arg, audio = sys.argv[1], sys.argv[2]
+
+    interp = find_interpreter()
+    if interp is not None:
+        os.execv(interp, [interp, os.path.abspath(__file__), model_arg, audio])
+
+    from faster_whisper import WhisperModel
+
+    # A bare name is a model to fetch or find in the shared cache; a path is a
+    # converted model directory. Keeping both working is what lets one download
+    # serve every project on the machine.
+    model_dir = os.environ.get("VOX_MODEL_DIR") or os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+        "vox", "models",
+    )
+    cache = os.environ.get("VOX_WHISPER_CACHE", model_dir)
+
+    name = os.path.basename(model_arg.rstrip("/"))
+    if os.path.isdir(model_arg):
+        name, cache = model_arg, None
+
+    kwargs = dict(
+        device=os.environ.get("VOX_WHISPER_DEVICE", "cpu"),
+        compute_type=os.environ.get("VOX_WHISPER_COMPUTE", "int8"),
+        cpu_threads=int(os.environ.get("VOX_WHISPER_THREADS", "4")),
+    )
+    if cache:
+        kwargs["download_root"] = cache
+    # Offline by default: dictation should not quietly reach the network.
+    if os.environ.get("VOX_WHISPER_ALLOW_DOWNLOAD") != "1":
+        kwargs["local_files_only"] = True
+
+    model = WhisperModel(name, **kwargs)
+    segments, _ = model.transcribe(
+        audio,
+        language=os.environ.get("VOX_WHISPER_LANGUAGE") or None,
+        beam_size=int(os.environ.get("VOX_WHISPER_BEAM", "1")),
+        best_of=1,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+    print("".join(s.text for s in segments).strip())
+
+
+if __name__ == "__main__":
+    main()

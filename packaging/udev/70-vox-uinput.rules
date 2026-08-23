@@ -1,0 +1,24 @@
+# vox - allow the dictation service to create a virtual keyboard.
+#
+# vox types transcripts through a uinput virtual keyboard. That is the only
+# approach that works identically on X11 and on every Wayland compositor:
+# xdotool is X11-only, and wtype needs a protocol GNOME and KDE do not
+# implement. The tradeoff is that it needs write access to /dev/uinput.
+#
+# SECURITY, PLAINLY: write access to /dev/uinput is the ability to synthesize
+# arbitrary keystrokes into the active session. That is inherent to what a
+# dictation tool does -- it exists to type for you -- but it means any process
+# with this access can type anything, including into a sudo prompt.
+#
+# TAG+="uaccess" scopes it to the currently active LOCAL session and revokes on
+# logout, which is narrower than GROUP="input" and much narrower than adding
+# yourself to a group permanently. Note uaccess is implemented by
+# systemd-logind; on OpenRC, runit or s6 it does nothing and you will need the
+# group-based line instead.
+#
+# If you would rather not grant this at all, vox falls back to wtype, ydotool
+# or xdotool. `vox doctor` reports which it would use.
+
+ACTION=="remove", GOTO="vox_end"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+LABEL="vox_end"
