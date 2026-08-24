@@ -124,6 +124,7 @@ dependency, works with no session bus, and is trivial to drive from a script.
 | `cancel` | Abandon without transcribing |
 | `state` | `ready` \| `listening` \| `transcribing` |
 | `subscribe` | Stream state changes, for building a UI |
+| `key NAME` | Press a single key: `Return`, `Tab`, `BackSpace`, `Escape`, arrows |
 | `info` | Which engine, recorder and injector are in use |
 
 ```sh
@@ -132,6 +133,11 @@ echo toggle | nc -U $XDG_RUNTIME_DIR/vox.sock
 
 `subscribe` is what a microphone button uses to show listening and transcribing
 without polling.
+
+`key` exists because a touch panel has no physical keyboard to submit with.
+Pressing a key and typing text are the same capability -- synthetic input into
+the focused window -- so it reuses the virtual keyboard rather than growing a
+second mechanism with its own device and permissions.
 
 ## Roadmap
 

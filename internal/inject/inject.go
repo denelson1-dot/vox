@@ -27,11 +27,27 @@ import (
 	"unsafe"
 )
 
-// Injector types text.
+// Injector types text and presses named keys.
+//
+// Pressing a key is the same capability as typing text -- both are synthetic
+// input into the focused window -- so it lives here rather than growing a
+// second mechanism with its own device and permissions.
 type Injector interface {
 	Type(text string) error
+	// Key presses a named key, e.g. "Return", "Tab", "BackSpace", "Escape".
+	Key(name string) error
 	Name() string
 	Close() error
+}
+
+// namedKeys are the keys worth exposing: the ones a touch panel needs when
+// there is no physical keyboard, from
+// include/uapi/linux/input-event-codes.h.
+var namedKeys = map[string]uint16{
+	"Return": 28, "Enter": 28,
+	"Tab": 15, "BackSpace": 14, "Escape": 1, "Delete": 111,
+	"Up": 103, "Down": 108, "Left": 105, "Right": 106,
+	"Home": 102, "End": 107, "space": 57,
 }
 
 // Detect returns the best available injector.
@@ -76,6 +92,28 @@ func detectExternal() (Injector, error) {
 type external struct {
 	name string
 	argv func(string) []string
+}
+
+func (e *external) Key(name string) error {
+	var argv []string
+	switch e.name {
+	case "wtype":
+		argv = []string{"wtype", "-k", name}
+	case "ydotool":
+		// ydotool takes keycodes rather than names.
+		code, ok := namedKeys[name]
+		if !ok {
+			return fmt.Errorf("ydotool: unknown key %q", name)
+		}
+		argv = []string{"ydotool", "key", fmt.Sprintf("%d:1", code), fmt.Sprintf("%d:0", code)}
+	default:
+		argv = []string{"xdotool", "key", "--clearmodifiers", name}
+	}
+	out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s key %s: %w: %s", e.name, name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (e *external) Name() string { return e.name }
@@ -135,10 +173,14 @@ func (u *Uinput) setup() error {
 	if err := ioctl(u.fd, uiSetEvBit, evKey); err != nil {
 		return fmt.Errorf("UI_SET_EVBIT: %w", err)
 	}
-	// Declare every keycode the layout can produce, plus shift.
+	// Declare every keycode the layout can produce, plus shift and the named
+	// keys. A keycode not declared here is silently dropped by the kernel.
 	declared := map[uint16]bool{keyLeftShift: true}
 	for _, k := range layout {
 		declared[k.code] = true
+	}
+	for _, code := range namedKeys {
+		declared[code] = true
 	}
 	for code := range declared {
 		if err := ioctl(u.fd, uiSetKeyBit, uintptr(code)); err != nil {
@@ -161,6 +203,18 @@ func (u *Uinput) setup() error {
 
 // Name identifies the injector.
 func (u *Uinput) Name() string { return "uinput" }
+
+// Key presses and releases a named key.
+func (u *Uinput) Key(name string) error {
+	if u.closed {
+		return fmt.Errorf("virtual keyboard is closed")
+	}
+	code, ok := namedKeys[name]
+	if !ok {
+		return fmt.Errorf("unknown key %q", name)
+	}
+	return u.press(key{code: code})
+}
 
 // Type sends text as keystrokes.
 //

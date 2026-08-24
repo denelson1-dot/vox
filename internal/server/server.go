@@ -183,6 +183,14 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 	return text, nil
 }
 
+// Key presses a single named key in the focused window.
+func (s *Server) Key(name string) error {
+	if name == "" {
+		return fmt.Errorf("no key named")
+	}
+	return s.injector.Key(name)
+}
+
 // Cancel abandons a recording without transcribing.
 func (s *Server) Cancel() error {
 	s.mu.Lock()
@@ -293,6 +301,12 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			return
 		case "":
 		default:
+			// "key NAME" presses a single key. A touch panel with no physical
+			// keyboard needs Return to submit what was just dictated.
+			if name, ok := strings.CutPrefix(cmd, "key "); ok {
+				reply(conn, s.Key(strings.TrimSpace(name)))
+				continue
+			}
 			fmt.Fprintf(conn, "error unknown command %q\n", cmd)
 		}
 	}
