@@ -31,15 +31,17 @@ type StreamConfig struct {
 	MaxSeconds   float64
 }
 
-// DefaultStreamConfig returns streaming turned off.
+// DefaultStreamConfig returns streaming turned on.
 //
-// Off by default because it trades accuracy for latency: Whisper is more
-// accurate given more context, so a six second chunk is transcribed slightly
-// worse than the same words inside a thirty second utterance. Whether that is
-// a good trade depends on how long you talk for and how much the wait bothers
-// you, which is not something to decide on someone's behalf.
+// On by default because waiting for a whole utterance to transcribe after you
+// stop talking is the worst part of using dictation, and the wait grows with
+// how much you said. Every chunk is given the preceding text as context, so
+// the pieces join as one transcript rather than reading as fragments.
+//
+// Disable with -stream=false to transcribe in a single pass, which is slightly
+// more accurate because the engine sees the whole utterance at once.
 func DefaultStreamConfig() StreamConfig {
-	return StreamConfig{Enabled: false, ChunkSeconds: defaultChunkSeconds, MaxSeconds: defaultMaxChunk}
+	return StreamConfig{Enabled: true, ChunkSeconds: defaultChunkSeconds, MaxSeconds: defaultMaxChunk}
 }
 
 // streamLoop transcribes and types the recording as it is captured.
@@ -101,20 +103,27 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 				s.log.Warn("streaming: writing chunk", "err", err)
 				continue
 			}
-			text, err := s.engine.Transcribe(ctx, tmp)
+			s.mu.Lock()
+			prior := s.streamPrior
+			s.mu.Unlock()
+
+			text, err := s.engine.TranscribeWithContext(ctx, tmp, prior)
 			if err != nil {
 				s.log.Warn("streaming: transcribing chunk", "err", err)
 				continue
 			}
-			if text = strings.TrimSpace(text); text == "" {
+			text = cleanChunk(text)
+			if text == "" {
 				continue
 			}
-			s.log.Info("streaming chunk", "seconds", audio.Seconds(cut), "chars", len(text))
-			if err := s.injector.Type(text + " "); err != nil {
+			out := joinChunk(prior, text)
+			s.log.Info("streaming chunk", "seconds", audio.Seconds(cut), "chars", len(out))
+			if err := s.injector.Type(out); err != nil {
 				s.log.Warn("streaming: typing chunk", "err", err)
 			}
 			s.mu.Lock()
 			s.streamedAny = true
+			s.streamPrior = strings.TrimSpace(out)
 			s.mu.Unlock()
 		}
 	}

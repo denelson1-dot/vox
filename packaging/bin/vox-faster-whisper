@@ -84,11 +84,18 @@ def main():
     # decoding is the right choice only when latency actually hurts, and for
     # dictation it does not.
     beam = int(os.environ.get("VOX_WHISPER_BEAM", "5"))
+
+    # What was transcribed just before this chunk, when streaming. Without it
+    # the model treats every chunk as a fresh utterance: it recapitalises, it
+    # re-punctuates, and it writes an ellipsis where the audio was cut.
+    prompt = os.environ.get("VOX_PROMPT") or None
+
     segments, _ = model.transcribe(
         audio,
         language=os.environ.get("VOX_WHISPER_LANGUAGE") or None,
         beam_size=beam,
         best_of=beam,
+        initial_prompt=prompt,
         vad_filter=True,
         # Off deliberately. Conditioning on previous text improves long-form
         # transcription but can send the model into repetition loops, and a

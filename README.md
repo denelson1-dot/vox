@@ -135,13 +135,14 @@ external tool.
 
 ## Streaming
 
-By default vox transcribes when you stop talking, so a long dictation means a
-long wait at the end. `-stream` transcribes as you go and types each piece as
-it is ready, so the pause after tapping stop is a second or two regardless of
-how long you spoke.
+Text appears while you speak, the way phone and desktop dictation does, rather
+than arriving all at once when you stop. The wait after tapping stop is a
+second or two regardless of how long you spoke.
+
+This is the default. To transcribe in a single pass instead:
 
 ```sh
-vox daemon -stream -chunk-seconds 6
+vox daemon -stream=false
 ```
 
 **Recording never stops on its own.** Silence is used to decide *where* to cut
@@ -153,11 +154,27 @@ Your pauses are what make it work well: a chunk is cut at the quietest moment
 near the target length, so a natural pause becomes a clean boundary. Talk
 without pausing and it still cuts, just at the least-bad point it can find.
 
-The tradeoff is real. Whisper is more accurate with more context, so a
-six-second chunk is transcribed slightly worse than the same words inside a
-thirty-second utterance. It is off by default for that reason. Longer chunks
-recover accuracy and give back latency; `-chunk-seconds 10` is a reasonable
-middle.
+### Making the seams invisible
+
+Chunking is an implementation detail and should not be visible in the
+transcript. Two things would otherwise give it away:
+
+**Ellipses.** Whisper writes `...` when speech trails off or starts
+mid-utterance, which is exactly what a chunk boundary looks like to it. Left
+alone this litters dictation with pauses the speaker never made — and they land
+precisely where the speaker was most fluent, since chunks are cut at the
+quietest moment. They are stripped.
+
+**Restarted sentences.** Every chunk looks like the beginning of an utterance,
+so the engine capitalises it and re-punctuates. Each chunk is given the
+preceding text as an `initial_prompt`, so the model knows it is continuing, and
+a leading capital mid-sentence is lowered again — except for `I`, acronyms and
+mixed-case names.
+
+The remaining tradeoff is real: Whisper is more accurate with more context, so
+a six-second chunk is slightly worse than the same words inside a thirty-second
+utterance. Longer chunks recover accuracy and give back latency;
+`-chunk-seconds 10` is a reasonable middle.
 
 ## Audio capture
 

@@ -69,6 +69,7 @@ type Server struct {
 	streamDone  chan struct{}
 	streamRead  *audio.Reader
 	streamedAny bool
+	streamPrior string // what has been typed, as context for the next chunk
 
 	// subscribers receive state changes, so a UI can show listening and
 	// transcribing without polling.
@@ -152,6 +153,7 @@ func (s *Server) Start() error {
 	s.mu.Lock()
 	s.session, s.audioIn = sess, path
 	s.streamedAny = false
+	s.streamPrior = ""
 	s.streamDone = nil
 	s.streamRead = nil
 	if s.streamCfg.Enabled {
@@ -229,17 +231,29 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 		source = tail
 	}
 
+	s.mu.Lock()
+	prior := s.streamPrior
+	s.mu.Unlock()
+
 	start := time.Now()
-	text, err := s.engine.Transcribe(ctx, source)
+	text, err := s.engine.TranscribeWithContext(ctx, source, prior)
 	if err != nil {
 		s.reset()
 		return "", err
 	}
 	s.log.Info("transcribed", "took", time.Since(start), "chars", len(text))
 
+	if reader != nil {
+		// The final piece is a chunk like any other and carries the same
+		// boundary artefacts.
+		text = cleanChunk(text)
+	}
 	if text != "" {
-		// A trailing space, so consecutive dictations do not run together.
-		if err := s.injector.Type(text + " "); err != nil {
+		out := text + " "
+		if reader != nil {
+			out = joinChunk(prior, text)
+		}
+		if err := s.injector.Type(out); err != nil {
 			s.reset()
 			return text, fmt.Errorf("typing the transcript: %w", err)
 		}

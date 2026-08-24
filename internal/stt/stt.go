@@ -27,6 +27,13 @@ import (
 type Engine interface {
 	// Transcribe returns the text spoken in the given WAV file.
 	Transcribe(ctx context.Context, audioPath string) (string, error)
+	// TranscribeWithContext is Transcribe given what was said just before.
+	//
+	// Streaming cuts audio into chunks, and without context an engine treats
+	// each one as a fresh utterance: it recapitalises, it re-punctuates, and
+	// it writes an ellipsis where the audio was cut. Telling it what preceded
+	// the chunk makes the pieces join as one continuous transcript.
+	TranscribeWithContext(ctx context.Context, audioPath, prior string) (string, error)
 	// Name identifies the engine, for logs and status.
 	Name() string
 	// Check reports whether the engine is usable, with an actionable reason
@@ -204,6 +211,11 @@ func modelPresent(model string) bool {
 
 // Transcribe runs the engine over one audio file.
 func (c *Command) Transcribe(ctx context.Context, audioPath string) (string, error) {
+	return c.TranscribeWithContext(ctx, audioPath, "")
+}
+
+// TranscribeWithContext passes preceding text to the engine as a prompt.
+func (c *Command) TranscribeWithContext(ctx context.Context, audioPath, prior string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, c.p.Timeout)
 	defer cancel()
 
@@ -215,6 +227,11 @@ func (c *Command) Transcribe(ctx context.Context, audioPath string) (string, err
 	}
 
 	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
+	if prior != "" {
+		// Through the environment rather than argv: a transcript is untrusted
+		// text and has no business being parsed as arguments.
+		cmd.Env = append(os.Environ(), "VOX_PROMPT="+lastWords(prior, 200))
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 
@@ -225,6 +242,19 @@ func (c *Command) Transcribe(ctx context.Context, audioPath string) (string, err
 		return "", fmt.Errorf("%s failed: %w: %s", c.p.Name, err, strings.TrimSpace(stderr.String()))
 	}
 	return clean(stdout.String(), c.p.StripPrefixes), nil
+}
+
+// lastWords returns the tail of a string, cut on a word boundary. Engines cap
+// prompt length, and the words nearest the chunk are the useful ones.
+func lastWords(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	s = s[len(s)-max:]
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
 }
 
 // resolveModel turns a bare model name into a path under the model directory,
