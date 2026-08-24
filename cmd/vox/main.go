@@ -43,8 +43,13 @@ Usage:
   vox version
 
 Daemon flags:
-  -engine NAME   Speech engine profile (default: autodetect)
-  -model PATH    Model path or name; bare names resolve under the model dir
+  -engine NAME       Speech engine profile (default: autodetect)
+  -model PATH        Model path or name; bare names resolve under the model dir
+  -stream            Transcribe and type while you speak, not all at the end
+  -chunk-seconds N   Target seconds per streamed chunk (default 6)
+
+Streaming never stops the recording. Pauses are used to choose where to split
+a chunk, never as a signal to stop listening.
 
 Everything speaks to one long-lived service, so the model loads once and every
 application on the machine shares it.
@@ -96,6 +101,8 @@ func daemon(args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	engineName := fs.String("engine", "", "speech engine profile")
 	model := fs.String("model", "", "model path or name")
+	streaming := fs.Bool("stream", false, "transcribe and type while you speak, instead of all at the end")
+	chunk := fs.Float64("chunk-seconds", 6, "target seconds per streamed chunk")
 	verbose := fs.Bool("v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -134,6 +141,13 @@ func daemon(args []string, stderr io.Writer) error {
 		return err
 	}
 	defer srv.Close()
+
+	if *streaming {
+		srv.SetStreaming(server.StreamConfig{
+			Enabled: true, ChunkSeconds: *chunk, MaxSeconds: *chunk * 2.3,
+		})
+		log.Info("streaming enabled", "chunk_seconds", *chunk)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

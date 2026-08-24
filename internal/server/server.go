@@ -60,10 +60,15 @@ type Server struct {
 	injector inject.Injector
 	log      *slog.Logger
 
-	mu      sync.Mutex
-	state   State
-	session *audio.Session
-	audioIn string
+	streamCfg StreamConfig
+
+	mu          sync.Mutex
+	state       State
+	session     *audio.Session
+	audioIn     string
+	streamDone  chan struct{}
+	streamRead  *audio.Reader
+	streamedAny bool
 
 	// subscribers receive state changes, so a UI can show listening and
 	// transcribing without polling.
@@ -90,7 +95,15 @@ func New(engine stt.Engine, log *slog.Logger) (*Server, error) {
 	return &Server{
 		engine: engine, recorder: rec, injector: inj, log: log,
 		state: StateReady, subs: map[chan State]struct{}{},
+		streamCfg: DefaultStreamConfig(),
 	}, nil
+}
+
+// SetStreaming enables incremental transcription.
+func (s *Server) SetStreaming(c StreamConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.streamCfg = c
 }
 
 // State returns the current state.
@@ -138,10 +151,38 @@ func (s *Server) Start() error {
 	}
 	s.mu.Lock()
 	s.session, s.audioIn = sess, path
+	s.streamedAny = false
+	s.streamDone = nil
+	s.streamRead = nil
+	if s.streamCfg.Enabled {
+		s.streamDone = make(chan struct{})
+		s.streamRead = audio.NewReader(path)
+	}
+	done, streaming := s.streamDone, s.streamCfg.Enabled
 	s.mu.Unlock()
+
 	s.setState(StateListening)
-	s.log.Info("listening")
+	if streaming {
+		// Text appears while you speak, so the wait at the end is only for
+		// whatever was said since the last chunk rather than the whole thing.
+		go s.streamLoopWith(context.Background(), path, done)
+		s.log.Info("listening (streaming)")
+	} else {
+		s.log.Info("listening")
+	}
 	return nil
+}
+
+// streamLoopWith shares the reader with Stop, so the two never transcribe the
+// same audio and no words are typed twice.
+func (s *Server) streamLoopWith(ctx context.Context, path string, done <-chan struct{}) {
+	s.mu.Lock()
+	r := s.streamRead
+	s.mu.Unlock()
+	if r == nil {
+		return
+	}
+	s.streamLoopShared(ctx, r, path, done)
 }
 
 // Stop ends recording, transcribes, and types the result.
@@ -157,6 +198,16 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 
 	defer os.RemoveAll(filepath.Dir(path))
 
+	// Stop the streaming loop before reading the tail, so both never
+	// transcribe the same audio.
+	s.mu.Lock()
+	done, reader, streamed := s.streamDone, s.streamRead, s.streamedAny
+	s.streamDone = nil
+	s.mu.Unlock()
+	if done != nil {
+		close(done)
+	}
+
 	if err := sess.Stop(); err != nil {
 		s.reset()
 		return "", err
@@ -164,8 +215,22 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 	s.setState(StateTranscribing)
 	s.log.Info("transcribing", "engine", s.engine.Name())
 
+	// When streaming, only the audio since the last chunk is left. That is the
+	// whole point: the wait at the end is a second or two rather than the
+	// length of everything you said.
+	source := path
+	if reader != nil {
+		tail, ok := s.remainder(reader, filepath.Dir(path))
+		if !ok {
+			s.log.Info("nothing left to transcribe", "streamed", streamed)
+			s.reset()
+			return "", nil
+		}
+		source = tail
+	}
+
 	start := time.Now()
-	text, err := s.engine.Transcribe(ctx, path)
+	text, err := s.engine.Transcribe(ctx, source)
 	if err != nil {
 		s.reset()
 		return "", err

@@ -133,6 +133,32 @@ to the active local session via `uaccess` rather than granting it to a group
 permanently. Skip it with `install.sh --no-udev` and vox falls back to an
 external tool.
 
+## Streaming
+
+By default vox transcribes when you stop talking, so a long dictation means a
+long wait at the end. `-stream` transcribes as you go and types each piece as
+it is ready, so the pause after tapping stop is a second or two regardless of
+how long you spoke.
+
+```sh
+vox daemon -stream -chunk-seconds 6
+```
+
+**Recording never stops on its own.** Silence is used to decide *where* to cut
+a chunk, never *whether* to keep listening. People pause to think, and
+dictation that shuts off when they do is worse than dictation that is slow. Tap
+stop when you are finished; nothing else ends it.
+
+Your pauses are what make it work well: a chunk is cut at the quietest moment
+near the target length, so a natural pause becomes a clean boundary. Talk
+without pausing and it still cuts, just at the least-bad point it can find.
+
+The tradeoff is real. Whisper is more accurate with more context, so a
+six-second chunk is transcribed slightly worse than the same words inside a
+thirty-second utterance. It is off by default for that reason. Longer chunks
+recover accuracy and give back latency; `-chunk-seconds 10` is a reasonable
+middle.
+
 ## Audio capture
 
 Detected, not assumed: `pw-record` (PipeWire), then `parec` (PulseAudio), then
