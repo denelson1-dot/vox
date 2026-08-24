@@ -55,7 +55,37 @@ someone else's.
 | `vosk` | `vosk-transcriber` | Small and fully offline, lower accuracy |
 
 `vox daemon` autodetects the first usable one. Override with
-`-engine NAME -model PATH`.
+`-engine NAME -model NAME`.
+
+### Accuracy
+
+Defaults favour accuracy over speed, because dictation has latency to spare.
+Measured on an i5-8250U, transcribing a 22-second utterance:
+
+| Model | Decoding | Speed | |
+|---|---|---|---|
+| `base.en` | greedy (`beam=1`) | 20x realtime | fast and noticeably worse |
+| `base.en` | `beam=5`, all cores | 10x realtime | **default** |
+| `small.en` | `beam=5`, all cores | 4x realtime | better; still imperceptible for dictation |
+
+`beam_size=5` is faster-whisper's own default and cut word error rate by about
+a fifth in testing against greedy decoding. Running 10x faster than realtime
+means a ten-second utterance transcribes in one second, so there is no reason
+to spend that headroom on speed you cannot feel.
+
+If accuracy is not good enough, get a larger model -- that is the bigger lever:
+
+```sh
+vox models get small.en
+vox daemon -model small.en
+```
+
+A caveat on the numbers above: they are speed measurements. Attempts to score
+accuracy with synthetic speech were not meaningful -- every configuration
+transcribed espeak output perfectly, because synthetic speech is far more
+regular than the human speech these models are trained on. Only the
+same-model beam comparison is a real accuracy result. Judge models with your
+own voice; nothing else generalises.
 
 ### Already have faster-whisper?
 

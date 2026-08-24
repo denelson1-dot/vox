@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -38,6 +39,7 @@ Usage:
   vox state              ready | listening | transcribing
   vox doctor             Report what is installed and what is missing
   vox models             Show the model directory and what is in it
+  vox models get NAME    Download a model, e.g. small.en, medium.en
   vox version
 
 Daemon flags:
@@ -73,6 +75,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "doctor":
 		return doctor(stdout)
 	case "models":
+		if len(args) > 2 && args[1] == "get" {
+			return fetchModel(args[2], stdout)
+		}
 		return models(stdout)
 	case "version":
 		fmt.Fprintln(stdout, version)
@@ -203,6 +208,72 @@ func doctor(out io.Writer) error {
 	return nil
 }
 
+// knownModels are the faster-whisper models worth suggesting, with the
+// tradeoff stated rather than left for the user to discover.
+var knownModels = []struct{ name, size, note string }{
+	{"tiny.en", "75 MB", "fastest, noticeably less accurate"},
+	{"base.en", "142 MB", "the usual starting point"},
+	{"small.en", "464 MB", "clearly better than base; still comfortably realtime on a laptop CPU"},
+	{"medium.en", "1.5 GB", "better again, but slow on CPU without a GPU"},
+}
+
+// fetchModel downloads a model into the shared directory.
+//
+// Shelling out to the engine's own tooling rather than reimplementing a
+// HuggingFace client: the layout, resumption and checksums are theirs to get
+// right, and a bad model file fails in confusing ways.
+func fetchModel(name string, out io.Writer) error {
+	repo := name
+	if !strings.Contains(repo, "/") {
+		repo = "Systran/faster-whisper-" + name
+	}
+	dir := stt.ModelDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "downloading %s into %s\n", repo, dir)
+
+	script := `import sys
+from huggingface_hub import snapshot_download
+print(snapshot_download(sys.argv[1], cache_dir=sys.argv[2]))`
+	py := findPython()
+	if py == "" {
+		return fmt.Errorf("no Python with huggingface_hub found; "+
+			"install it, or download the model manually into %s", dir)
+	}
+	cmd := exec.Command(py, "-c", script, repo, dir)
+	cmd.Stdout, cmd.Stderr = out, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("downloading %s: %w", repo, err)
+	}
+	fmt.Fprintf(out, "\ndone. use it with:  vox daemon -model %s\n", name)
+	return nil
+}
+
+// findPython locates an interpreter that has huggingface_hub, preferring an
+// existing virtualenv over asking the user to make another.
+func findPython() string {
+	home, _ := os.UserHomeDir()
+	for _, c := range []string{
+		os.Getenv("VOX_WHISPER_VENV") + "/bin/python",
+		home + "/.local/share/vox/venv/bin/python",
+		home + "/.local/share/voice-dictation/venv/bin/python",
+		"python3",
+	} {
+		if c == "/bin/python" {
+			continue
+		}
+		p, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+		if exec.Command(p, "-c", "import huggingface_hub").Run() == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 func models(out io.Writer) error {
 	dir := stt.ModelDir()
 	fmt.Fprintf(out, "model directory: %s\n\n", dir)
@@ -220,12 +291,12 @@ func models(out io.Writer) error {
 		return nil
 	}
 	for _, e := range entries {
-		info, _ := e.Info()
-		size := ""
-		if info != nil && !e.IsDir() {
-			size = fmt.Sprintf("  %.0f MB", float64(info.Size())/(1<<20))
-		}
-		fmt.Fprintf(out, "  %s%s\n", e.Name(), size)
+		fmt.Fprintf(out, "  %s\n", e.Name())
 	}
+	fmt.Fprintln(out, "\navailable to download:")
+	for _, m := range knownModels {
+		fmt.Fprintf(out, "  %-11s %-8s %s\n", m.name, m.size, m.note)
+	}
+	fmt.Fprintln(out, "\n  vox models get small.en")
 	return nil
 }
