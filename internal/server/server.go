@@ -70,7 +70,8 @@ type Server struct {
 	streamDone  chan struct{} // closed to ask the streaming loop to finish
 	streamRead  *audio.Reader
 	streamedAny bool
-	streamPrior string // what has been typed, as context for the next chunk
+	streamPrior string // the last chunk as the engine wrote it: its context for the next
+	streamTyped string // the last chunk as it was typed, which may have lost a full stop
 
 	// Every recording gets its own context. Cancelling it kills whatever
 	// transcription is in flight and forbids any further typing, which is
@@ -219,6 +220,7 @@ func (s *Server) Start() error {
 	s.sessCtx, s.sessCancel = ctx, cancel
 	s.streamedAny = false
 	s.streamPrior = ""
+	s.streamTyped = ""
 	s.streamDone, s.streamRead, s.loopDone = done, reader, loopDone
 	if limit > 0 {
 		s.limitTimer = time.AfterFunc(limit, func() { s.limitReached(sess, limit) })
@@ -315,7 +317,7 @@ func (s *Server) stop(ctx context.Context, want *audio.Session) (string, error) 
 	}
 
 	s.mu.Lock()
-	prior := s.streamPrior
+	prior, typedPrev := s.streamPrior, s.streamTyped
 	s.mu.Unlock()
 
 	// Cancel must reach this transcription too, not only the caller's ctx.
@@ -342,7 +344,7 @@ func (s *Server) stop(ctx context.Context, want *audio.Session) (string, error) 
 	if text != "" {
 		out := text + " "
 		if reader != nil {
-			out = joinChunk(prior, text)
+			out = joinChunk(typedPrev, text)
 		}
 		if _, err := s.typeText(sessCtx, out); err != nil {
 			s.reset(sess)

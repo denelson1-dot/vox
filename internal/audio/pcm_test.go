@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // tone builds PCM: `speech` seconds of signal, then `quiet` seconds of near
@@ -128,5 +129,29 @@ func TestReaderConsumesOnce(t *testing.T) {
 	grown, _ := r.Pending()
 	if len(grown) != len(more) {
 		t.Errorf("after append got %d bytes, want only the new %d", len(grown), len(more))
+	}
+}
+
+// The length of the quiet around a cut is what separates the gap between two
+// words from the end of a sentence.
+func TestPauseAt(t *testing.T) {
+	pcm := tone([]struct {
+		secs float64
+		loud bool
+	}{{1, true}, {0.05, false}, {1, true}, {0.5, false}, {1, true}, {0.3, false}})
+	at := func(sec float64) int { return Bytes(sec) }
+
+	if got := PauseAt(pcm, at(1.025)); got < 30*time.Millisecond || got > 70*time.Millisecond {
+		t.Errorf("word gap measured %v, want about 50ms", got)
+	}
+	if got := PauseAt(pcm, at(2.3)); got < 450*time.Millisecond || got > 550*time.Millisecond {
+		t.Errorf("sentence pause measured %v, want about 500ms", got)
+	}
+	if got := PauseAt(pcm, at(0.5)); got != 0 {
+		t.Errorf("a cut through speech measured %v, want 0", got)
+	}
+	// Quiet that runs off the end may go on: it must not read as short.
+	if got := PauseAt(pcm, at(3.7)); got != OpenPause {
+		t.Errorf("trailing quiet measured %v, want OpenPause", got)
 	}
 }

@@ -2,7 +2,10 @@
 
 package server
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // cleanChunk removes the artefacts of having cut audio mid-sentence.
 //
@@ -71,7 +74,11 @@ func lowerFirstIfPlain(s string) string {
 	if len(fields) == 0 {
 		return s
 	}
-	w := fields[0]
+	// Punctuation after the word is not part of it: "Top," is a plain word.
+	w := strings.TrimRight(fields[0], ".,;:!?\"")
+	if w == "" {
+		return s
+	}
 	if w == "I" || strings.HasPrefix(w, "I'") {
 		return s
 	}
@@ -85,4 +92,65 @@ func lowerFirstIfPlain(s string) string {
 		return s // mixed case, e.g. a product name
 	}
 	return strings.ToLower(s[:1]) + s[1:]
+}
+
+// sentencePause is the shortest pause at a chunk boundary that is taken as
+// the end of a sentence.
+//
+// Whisper hears each chunk on its own, so audio that stops after a word sounds
+// like an ending and it writes a full stop at almost every cut: about half of
+// all mid-sentence boundaries, measured. The pause at the cut is the evidence
+// it lacks. Between words it is a few tens of milliseconds, at a comma one or
+// two hundred, and between sentences longer. Measured on synthetic speech,
+// where sentence pauses are shorter than people's, a threshold of 0.3 s
+// removed the false stops at the cost of an occasional missed one.
+const sentencePause = 300 * time.Millisecond
+
+// noEnd holds words that a sentence practically never ends on. A full stop
+// after one of them is a cut, however long the pause: someone thinking
+// mid-sentence ("I went to the... shop") pauses for as long as they like.
+var noEnd = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields(`a an the and or but nor so because if than
+		that which who whose of to in on at by for from with into onto about as
+		like my your his her its our their this these those is are was were be
+		been being am has have had do does did will would shall should can could
+		may might must very just`) {
+		noEnd[w] = true
+	}
+}
+
+// abbreviation holds titles whose full stop is part of the word. One lands at
+// a cut whenever the cut falls between "Dr." and the name, a short pause.
+var abbreviation = map[string]bool{
+	"mr": true, "mrs": true, "ms": true, "dr": true, "st": true, "vs": true,
+	"etc": true, "prof": true, "jr": true, "sr": true,
+}
+
+// softenEnd removes a chunk's closing . ? or ! when the cut it ends at does
+// not look like the end of a sentence. It reports whether it did.
+//
+// Only a single closing mark goes. "?!" or an abbreviation such as "a.m." is
+// deliberate and stays, and so does everything inside the chunk: Whisper
+// heard those sentence ends whole, so they are trustworthy.
+func softenEnd(text string, pause time.Duration) (string, bool) {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return text, false
+	}
+	last := fields[len(fields)-1]
+	mark := last[len(last)-1]
+	if mark != '.' && mark != '?' && mark != '!' {
+		return text, false
+	}
+	word := last[:len(last)-1]
+	if word == "" || strings.ContainsAny(word, ".?!") || abbreviation[strings.ToLower(word)] {
+		return text, false
+	}
+	if pause >= sentencePause && !noEnd[strings.ToLower(word)] {
+		return text, false
+	}
+	trimmed := strings.TrimRight(text, " ")
+	return trimmed[:len(trimmed)-1], true
 }

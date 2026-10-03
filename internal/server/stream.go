@@ -103,6 +103,9 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 			}
 
 			segment := pcm[:cut]
+			// Measured before consuming: the audio after the cut is what
+			// shows how long the pause runs.
+			pause := audio.PauseAt(pcm, cut)
 			reader.Consume(cut)
 			if audio.IsSilent(segment) {
 				// Nothing said. Transcribing silence wastes a second of CPU
@@ -114,7 +117,7 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 				continue
 			}
 			s.mu.Lock()
-			prior := s.streamPrior
+			prior, typedPrev := s.streamPrior, s.streamTyped
 			s.mu.Unlock()
 
 			text, err := s.engine.TranscribeWithContext(ctx, tmp, prior)
@@ -129,8 +132,14 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 			if text == "" {
 				continue
 			}
-			out := joinChunk(prior, text)
-			s.log.Info("streaming chunk", "seconds", audio.Seconds(cut), "chars", len(out))
+			// The engine keeps its own view of the text, full stops and all,
+			// so what it is prompted with is exactly what it would be without
+			// softening; only what is typed changes.
+			heard := strings.TrimSpace(joinChunk(prior, text))
+			body, softened := softenEnd(strings.TrimSpace(joinChunk(typedPrev, text)), pause)
+			out := body + " "
+			s.log.Info("streaming chunk", "seconds", audio.Seconds(cut), "chars", len(out),
+				"pause", pause, "end_dropped", softened)
 			typed, err := s.typeText(ctx, out)
 			if !typed {
 				return // cancelled before this chunk could be typed
@@ -140,7 +149,8 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 			}
 			s.mu.Lock()
 			s.streamedAny = true
-			s.streamPrior = strings.TrimSpace(out)
+			s.streamPrior = heard
+			s.streamTyped = body
 			s.mu.Unlock()
 		}
 	}

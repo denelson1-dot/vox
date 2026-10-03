@@ -171,7 +171,9 @@ func TestStopWaitsForTheChunkInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := kb.text(), "One. Two. "; got != want {
+	// The test recorder never pauses, so the cut after "One." is a word gap
+	// and its full stop is dropped: one sentence, in order.
+	if got, want := kb.text(), "One two. "; got != want {
 		t.Errorf("typed %q, want %q", got, want)
 	}
 	if kb.overlapped.Load() {

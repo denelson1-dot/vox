@@ -184,7 +184,7 @@ without pausing and it still cuts, just at the least-bad point it can find.
 ### Making the seams invisible
 
 Chunking is an implementation detail and should not be visible in the
-transcript. Two things would otherwise give it away:
+transcript. Three things would otherwise give it away:
 
 **Ellipses.** Whisper writes `...` when speech trails off or starts
 mid-utterance, which is exactly what a chunk boundary looks like to it. Left
@@ -197,6 +197,17 @@ so the engine capitalises it and re-punctuates. Each chunk is given the
 preceding text as an `initial_prompt`, so the model knows it is continuing, and
 a leading capital mid-sentence is lowered again — except for `I`, acronyms and
 mixed-case names.
+
+**False full stops.** Audio that stops after a word sounds like an ending, so
+Whisper closes almost every chunk with a full stop — measured, about half of
+all cuts that fell mid-sentence. vox measures the pause each cut landed in:
+between words it is tens of milliseconds, between sentences it is longer. Under
+0.3 s, or after a word no sentence ends on ("the", "to", "and"), the closing
+`.` `?` or `!` is dropped and the next chunk carries on in lowercase. The
+engine still sees its own punctuation as context, so its accuracy is
+untouched; only what is typed changes. Each chunk's pause is in the log
+(`pause=`, `end_dropped=`), which is what to look at if it guesses wrong for
+your voice.
 
 The remaining tradeoff is real: Whisper is more accurate with more context, so
 a six-second chunk is slightly worse than the same words inside a thirty-second

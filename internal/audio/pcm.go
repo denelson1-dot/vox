@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
+	"time"
 )
 
 // wavHeaderSize is the canonical 44-byte RIFF header the recorders emit.
@@ -105,10 +107,60 @@ func rms(pcm []byte) float64 {
 	return math.Sqrt(sum / float64(n))
 }
 
+// PauseAt measures the pause a cut landed in: how long the quiet around it
+// lasts, in either direction.
+//
+// The cut itself is the quietest moment nearby, which says nothing about
+// whether it is the gap between two words or the end of a sentence. The
+// length of the quiet does: people pause noticeably longer between sentences
+// than between words.
+//
+// Quiet is judged against this stretch's own loud level, so it follows mic
+// gain and room noise rather than an absolute number. A pause that runs off
+// the end of the buffer may continue past it, so it is reported as
+// OpenPause: long, not measured.
+func PauseAt(pcm []byte, cut int) time.Duration {
+	win := Bytes(0.010)
+	n := len(pcm) / win
+	if n == 0 || cut < 0 || cut > len(pcm) {
+		return 0
+	}
+	e := make([]float64, n)
+	for i := range e {
+		e[i] = rms(pcm[i*win : (i+1)*win])
+	}
+	sorted := append([]float64(nil), e...)
+	sort.Float64s(sorted)
+	quiet := math.Max(silenceRMS, 0.10*sorted[n*9/10])
+
+	i := min(cut/win, n-1)
+	if e[i] >= quiet {
+		return 0
+	}
+	lo, hi := i, i
+	for lo > 0 && e[lo-1] < quiet {
+		lo--
+	}
+	for hi < n-1 && e[hi+1] < quiet {
+		hi++
+	}
+	if hi == n-1 {
+		return OpenPause
+	}
+	return time.Duration(hi-lo+1) * 10 * time.Millisecond
+}
+
+// OpenPause is what PauseAt reports for quiet that continues past the end of
+// the audio it was given.
+const OpenPause = time.Second
+
+// silenceRMS is the loudness below which audio is treated as silence.
+const silenceRMS = 120
+
 // IsSilent reports whether a span is quiet enough to be worth skipping.
 // Transcribing pure silence wastes a second of CPU and tends to make Whisper
 // hallucinate a stray phrase.
-func IsSilent(pcm []byte) bool { return rms(pcm) < 120 }
+func IsSilent(pcm []byte) bool { return rms(pcm) < silenceRMS }
 
 // WriteWAV writes PCM as a standalone WAV file for an engine to read.
 func WriteWAV(path string, pcm []byte) error {
