@@ -38,7 +38,28 @@ systemctl --user enable --now vox
 vox toggle                          # speak; run again to stop and type
 ```
 
-Bind `vox toggle` to a key for push-to-talk.
+Bind `vox-hotkey` to a key for push-to-talk, and you will see the on-screen
+indicator from your next login (or run `vox-overlay &` now).
+
+## Hotkey and indicator
+
+Two small companions are installed alongside the service.
+
+**`vox-hotkey`** is `vox toggle` for a keyboard shortcut. Stopping types the
+transcript within a second, and a shortcut such as Super+H usually still has
+Super held down at that moment, which turns every typed letter into a
+Super+letter shortcut. `vox-hotkey` waits (for at most two seconds) until the
+modifiers are released. The wait needs X11 and `python3-xlib`; without them it
+is a plain toggle.
+
+**`vox-overlay`** is a small pill near the bottom of the screen: red with a
+running timer while listening, amber while the last words are typed, grey if
+the service is down, and gone while idle. In the last thirty seconds before
+the recording limit it turns orange and counts down. It never takes focus and
+clicks pass straight through it, so it cannot steal the window you are
+dictating into. It follows the `subscribe` stream, so it does nothing while
+idle. It needs GTK 3 with PyGObject and cairo (`python3-gi`,
+`python3-gi-cairo`, `gir1.2-gtk-3.0`), and on Wayland it runs through XWayland.
 
 ## Speech engines
 
@@ -204,14 +225,14 @@ dependency, works with no session bus, and is trivial to drive from a script.
 | `state` | `ready` \| `listening` \| `transcribing` |
 | `subscribe` | Stream state changes, for building a UI |
 | `key NAME` | Press a single key: `Return`, `Tab`, `BackSpace`, `Escape`, arrows |
-| `info` | Which engine, recorder and injector are in use |
+| `info` | Which engine, recorder and injector are in use, and the recording limit |
 
 ```sh
 echo toggle | nc -U $XDG_RUNTIME_DIR/vox.sock
 ```
 
-`subscribe` is what a microphone button uses to show listening and transcribing
-without polling.
+`subscribe` is what a microphone button, or `vox-overlay`, uses to show
+listening and transcribing without polling.
 
 `key` exists because a touch panel has no physical keyboard to submit with.
 Pressing a key and typing text are the same capability -- synthetic input into

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=vox overlay
+Comment=On-screen indicator while vox dictation is listening or typing
+Exec=vox-overlay
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+
+"""Floating status pill for vox: shows while listening and while typing.
+
+Hidden when vox is idle. It never takes focus and lets clicks pass through,
+so it cannot steal the window dictation is typing into. While listening it
+shows how long you have been talking, and counts down through the last
+seconds before vox's -max-record limit stops the recording.
+
+It follows the service's subscribe stream rather than polling, so it costs
+nothing while dictation is idle, and it reconnects on its own when the service
+restarts.
+
+Needs GTK 3 and PyGObject with cairo (Debian/Ubuntu: python3-gi,
+python3-gi-cairo, gir1.2-gtk-3.0).
+"""
+
+import math
+import os
+import re
+import socket
+import threading
+import time
+
+# A click-through, always-on-top window placed at exact coordinates is an X11
+# idea. Under Wayland, run through XWayland, where it still works.
+os.environ.setdefault("GDK_BACKEND", "x11")
+
+import cairo  # noqa: E402
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+SOCKET = os.environ.get("VOX_SOCKET") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "vox.sock"
+)
+OFFLINE_AFTER = 2.0  # seconds disconnected before saying so; covers restarts
+WARN_BEFORE = 30  # seconds before vox's recording limit to start counting down
+BOTTOM_MARGIN = 72  # above the bottom of the work area, which excludes panels
+
+LOOK = {
+    "listening": ("Listening", (0.93, 0.27, 0.27)),
+    "transcribing": ("Typing…", (0.98, 0.70, 0.18)),
+    "offline": ("vox is not running", (0.55, 0.55, 0.55)),
+}
+
+
+def recording_limit():
+    """vox's -max-record limit in seconds, or None when there is none."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            sock.connect(SOCKET)
+            sock.sendall(b"info\n")
+            line = sock.makefile("r").readline()
+    except OSError:
+        return None
+    m = re.search(r"max_record=(\S+)", line)
+    if not m:
+        return None
+    # A Go duration such as 5m0s or 1h30m0s.
+    units = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+    total = sum(float(n) * units[u] for n, u in re.findall(r"([\d.]+)(ms|h|m|s)", m.group(1)))
+    return total or None
+
+
+def follow_states(on_state):
+    """Report every vox state change, reconnecting whenever the service goes.
+
+    Uses the service's own subscribe stream, so changes arrive the moment
+    they happen and nothing runs while dictation is idle.
+    """
+    down_since = None
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(SOCKET)
+                sock.sendall(b"subscribe\n")
+                down_since = None
+                for line in sock.makefile("r"):
+                    status, _, state = line.strip().partition(" ")
+                    if status == "ok" and state:
+                        on_state(state)
+        except OSError:
+            pass
+        now = time.monotonic()
+        down_since = down_since or now
+        if now - down_since >= OFFLINE_AFTER:
+            on_state("offline")
+        time.sleep(0.5)
+
+
+class Overlay(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_app_paintable(True)
+        self.set_accept_focus(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        visual = self.get_screen().get_rgba_visual()
+        if visual is not None:
+            self.set_visual(visual)
+        self.set_default_size(230, 44)
+        self.connect("draw", self.on_draw)
+        self.connect("realize", self.on_realize)
+
+        self.state = "ready"
+        self.phase = 0.0
+        self.listening_since = None
+        self.limit = None
+        GLib.timeout_add(50, self.tick)
+        threading.Thread(
+            target=follow_states,
+            args=(lambda st: GLib.idle_add(self.set_state, st),),
+            daemon=True,
+        ).start()
+
+    def on_realize(self, _widget):
+        # Empty input region: clicks go straight through to what is below.
+        self.get_window().input_shape_combine_region(cairo.Region(), 0, 0)
+
+    def place(self):
+        # Show on the monitor you are working on, which is where the pointer is.
+        width, height = self.get_size()
+        display = Gdk.Display.get_default()
+        _screen, px, py = display.get_default_seat().get_pointer().get_position()
+        geo = display.get_monitor_at_point(px, py).get_workarea()
+        self.move(
+            geo.x + (geo.width - width) // 2,
+            geo.y + geo.height - height - BOTTOM_MARGIN,
+        )
+
+    def set_state(self, state):
+        if state != self.state:
+            if state == "listening":
+                self.listening_since = time.monotonic()
+                self.limit = recording_limit()
+            self.state = state
+            if state in LOOK:
+                self.place()
+                self.show_all()
+                self.queue_draw()
+            else:
+                self.hide()
+        return False
+
+    def tick(self):
+        if self.state in LOOK:
+            self.phase = (self.phase + 0.05 * 2 * math.pi / 1.2) % (2 * math.pi)
+            self.queue_draw()
+        return True
+
+    def on_draw(self, _widget, cr):
+        label, (r, g, b) = LOOK.get(self.state, LOOK["offline"])
+        if self.state == "listening" and self.listening_since is not None:
+            elapsed = time.monotonic() - self.listening_since
+            label = f"{label}  {int(elapsed) // 60}:{int(elapsed) % 60:02d}"
+            if self.limit and self.limit - elapsed <= WARN_BEFORE:
+                left = max(0, math.ceil(self.limit - elapsed))
+                label = f"Stopping in 0:{left:02d}"
+                r, g, b = (1.0, 0.45, 0.0)
+        width = self.get_allocated_width()
+        height = self.get_allocated_height()
+
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        radius = height / 2
+        cr.new_sub_path()
+        cr.arc(width - radius, radius, radius, -math.pi / 2, math.pi / 2)
+        cr.arc(radius, radius, radius, math.pi / 2, 3 * math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(0.08, 0.08, 0.10, 0.88)
+        cr.fill_preserve()
+        cr.set_source_rgba(r, g, b, 0.9)
+        cr.set_line_width(1.5)
+        cr.stroke()
+
+        pulse = 0.5 + 0.5 * math.sin(self.phase)
+        cx, cy = radius + 2, height / 2
+        cr.set_source_rgba(r, g, b, 0.25 * pulse)
+        cr.arc(cx, cy, 7 + 5 * pulse, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(r, g, b)
+        cr.arc(cx, cy, 7, 0, 2 * math.pi)
+        cr.fill()
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(15)
+        extents = cr.text_extents(label)
+        cr.set_source_rgb(0.96, 0.96, 0.96)
+        cr.move_to(cx + 18, cy - extents.y_bearing - extents.height / 2)
+        cr.show_text(label)
+        return True
+
+
+def main():
+    Overlay()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

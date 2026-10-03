@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+
+"""Run `vox toggle` from a keyboard shortcut, once the shortcut keys are up.
+
+Bind this, rather than `vox toggle` itself, to a key such as Super+H.
+
+Stopping flushes the transcript and vox starts typing within a second. If the
+Super key from Super+H is still physically down at that point, every typed
+letter arrives as Super+letter and becomes a shortcut instead of text. So wait
+(briefly) for all modifiers to be released before handing over.
+
+The wait needs X11 and python-xlib (Debian/Ubuntu: python3-xlib). Without
+either it is skipped and this behaves exactly like `vox toggle`.
+"""
+
+import os
+import shutil
+import sys
+import time
+
+MODIFIERS = (
+    "Super_L", "Super_R", "Shift_L", "Shift_R",
+    "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R",
+)
+TIMEOUT = 2.0  # never hold dictation hostage to a key that is stuck down
+
+
+def find_vox():
+    """vox installed next to this script, else on PATH."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "vox")
+    if os.access(here, os.X_OK):
+        return here
+    return shutil.which("vox") or "vox"
+
+
+def wait_for_modifiers_released():
+    try:
+        from Xlib import XK, display
+
+        d = display.Display()
+    except Exception:
+        return  # no python-xlib, or no X display: nothing to wait on
+    try:
+        codes = {d.keysym_to_keycode(XK.string_to_keysym(n)) for n in MODIFIERS}
+        codes.discard(0)
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            keymap = d.query_keymap()
+            if not any(keymap[c // 8] & (1 << (c % 8)) for c in codes):
+                break
+            time.sleep(0.02)
+    except Exception:
+        pass  # never let the wait stop dictation from toggling
+    finally:
+        d.close()
+
+
+def main():
+    wait_for_modifiers_released()
+    vox = find_vox()
+    try:
+        os.execvp(vox, [vox, "toggle"])
+    except OSError as e:
+        sys.exit(f"vox-hotkey: cannot run {vox}: {e}")
+
+
+if __name__ == "__main__":
+    main()

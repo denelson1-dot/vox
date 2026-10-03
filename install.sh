@@ -7,6 +7,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
 UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 MODELS="${XDG_DATA_HOME:-$HOME/.local/share}/vox/models"
 RULES=/etc/udev/rules.d
 
@@ -33,6 +34,8 @@ say "Installing into $BIN"
 step "mkdir -p '$BIN' '$MODELS'"
 step "install -m755 '$REPO/vox' '$BIN/vox'"
 step "install -m755 '$REPO/packaging/bin/vox-faster-whisper' '$BIN/vox-faster-whisper'"
+step "install -m755 '$REPO/packaging/bin/vox-hotkey' '$BIN/vox-hotkey'"
+step "install -m755 '$REPO/packaging/bin/vox-overlay' '$BIN/vox-overlay'"
 
 if ((DO_UDEV)); then
     say "Installing the uinput rule (needs sudo)"
@@ -47,6 +50,11 @@ say "Installing the user service"
 step "mkdir -p '$UNIT'"
 step "install -m644 '$REPO/packaging/systemd/vox.service' '$UNIT/'"
 step "systemctl --user daemon-reload"
+
+say "Starting the on-screen indicator at login"
+# The absolute path, because ~/.local/bin is not always on PATH this early.
+step "mkdir -p '$AUTOSTART'"
+step "sed 's|^Exec=vox-overlay\$|Exec=$BIN/vox-overlay|' '$REPO/packaging/autostart/vox-overlay.desktop' > '$AUTOSTART/vox-overlay.desktop'"
 
 say "Checking for an existing faster-whisper install to reuse"
 if [[ -x "$HOME/.local/share/voice-dictation/venv/bin/python" ]]; then
@@ -65,6 +73,8 @@ Installed. Next:
   vox doctor                     what is present and what is missing
   systemctl --user enable --now vox
   vox toggle                     start dictating; run again to stop and type
+  vox-overlay &                  the on-screen indicator, now, rather than at next login
 
-Bind 'vox toggle' to a key in your desktop settings for push-to-talk.
+Bind 'vox-hotkey' to a key in your desktop settings for push-to-talk. It is
+'vox toggle' made safe for shortcuts that include a modifier, like Super+H.
 MSG
