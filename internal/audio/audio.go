@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -85,6 +86,9 @@ type Session struct {
 	cmd  *exec.Cmd
 	path string
 	rec  Recorder
+
+	stopOnce sync.Once
+	stopErr  error
 }
 
 // Start begins recording to path.
@@ -104,7 +108,16 @@ func Start(rec Recorder, path string) (*Session, error) {
 // SIGINT rather than SIGKILL, because the recorder has to write a valid WAV
 // header on the way out. A killed recorder leaves a truncated file that every
 // speech engine then rejects with a confusing error.
+//
+// Safe to call more than once, and from several goroutines: Stop and Cancel
+// can race to end the same recording, and the recorder can only be waited
+// for once.
 func (s *Session) Stop() error {
+	s.stopOnce.Do(func() { s.stopErr = s.stop() })
+	return s.stopErr
+}
+
+func (s *Session) stop() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}

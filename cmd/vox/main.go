@@ -47,9 +47,10 @@ Daemon flags:
   -model PATH        Model path or name; bare names resolve under the model dir
   -stream=false      Wait and transcribe in one pass (default is streaming)
   -chunk-seconds N   Target seconds per streamed chunk (default 6)
+  -max-record D      Stop a recording left running this long (default 5m; 0 = none)
 
 Streaming never stops the recording. Pauses choose where to split a chunk,
-never whether to keep listening.
+never whether to keep listening. Only -max-record ends one you forgot.
 
 Everything speaks to one long-lived service, so the model loads once and every
 application on the machine shares it.
@@ -103,6 +104,7 @@ func daemon(args []string, stderr io.Writer) error {
 	model := fs.String("model", "", "model path or name")
 	streaming := fs.Bool("stream", true, "transcribe and type while you speak; -stream=false waits until the end")
 	chunk := fs.Float64("chunk-seconds", 6, "target seconds per streamed chunk")
+	maxRecord := fs.Duration("max-record", server.DefaultMaxRecord, "stop a recording left running this long; 0 for no limit")
 	verbose := fs.Bool("v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -145,6 +147,7 @@ func daemon(args []string, stderr io.Writer) error {
 	srv.SetStreaming(server.StreamConfig{
 		Enabled: *streaming, ChunkSeconds: *chunk, MaxSeconds: *chunk * 2.3,
 	})
+	srv.SetMaxRecord(*maxRecord)
 	if *streaming {
 		log.Info("streaming", "chunk_seconds", *chunk)
 	} else {

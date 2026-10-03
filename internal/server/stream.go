@@ -21,8 +21,11 @@ import (
 const (
 	defaultChunkSeconds = 6.0
 	defaultMaxChunk     = 14.0 // force a cut even with no pause to be found
-	pollInterval        = 900 * time.Millisecond
 )
+
+// pollInterval is how often the loop looks for a chunk's worth of audio. A
+// variable only so tests need not wait out real dictation timings.
+var pollInterval = 900 * time.Millisecond
 
 // StreamConfig tunes incremental transcription.
 type StreamConfig struct {
@@ -75,6 +78,13 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 			// raced against by this loop.
 			return
 		case <-ticker.C:
+			// select picks at random among ready cases. Once done is closed,
+			// Stop is waiting on this loop, so never begin another chunk.
+			select {
+			case <-done:
+				return
+			default:
+			}
 			pcm, err := reader.Pending()
 			if err != nil || audio.Seconds(len(pcm)) < cfg.ChunkSeconds {
 				continue
@@ -108,6 +118,9 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 			s.mu.Unlock()
 
 			text, err := s.engine.TranscribeWithContext(ctx, tmp, prior)
+			if ctx.Err() != nil {
+				return // cancelled; the engine was killed mid-chunk
+			}
 			if err != nil {
 				s.log.Warn("streaming: transcribing chunk", "err", err)
 				continue
@@ -118,7 +131,11 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 			}
 			out := joinChunk(prior, text)
 			s.log.Info("streaming chunk", "seconds", audio.Seconds(cut), "chars", len(out))
-			if err := s.injector.Type(out); err != nil {
+			typed, err := s.typeText(ctx, out)
+			if !typed {
+				return // cancelled before this chunk could be typed
+			}
+			if err != nil {
 				s.log.Warn("streaming: typing chunk", "err", err)
 			}
 			s.mu.Lock()

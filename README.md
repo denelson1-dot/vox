@@ -145,10 +145,16 @@ This is the default. To transcribe in a single pass instead:
 vox daemon -stream=false
 ```
 
-**Recording never stops on its own.** Silence is used to decide *where* to cut
+**Pauses never stop the recording.** Silence is used to decide *where* to cut
 a chunk, never *whether* to keep listening. People pause to think, and
 dictation that shuts off when they do is worse than dictation that is slow. Tap
-stop when you are finished; nothing else ends it.
+stop when you are finished.
+
+The one exception is a recording someone forgot about. After five minutes vox
+stops and types what it has, exactly as if you had tapped stop: left running,
+it would keep typing into whatever has focus, and room noise that clears the
+silence threshold invites Whisper to invent phrases. Change the limit with
+`vox daemon -max-record 10m`, or remove it with `-max-record 0`.
 
 Your pauses are what make it work well: a chunk is cut at the quietest moment
 near the target length, so a natural pause becomes a clean boundary. Talk

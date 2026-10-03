@@ -61,15 +61,29 @@ type Server struct {
 	log      *slog.Logger
 
 	streamCfg StreamConfig
+	maxRecord time.Duration // 0 means no limit
 
 	mu          sync.Mutex
 	state       State
 	session     *audio.Session
 	audioIn     string
-	streamDone  chan struct{}
+	streamDone  chan struct{} // closed to ask the streaming loop to finish
 	streamRead  *audio.Reader
 	streamedAny bool
 	streamPrior string // what has been typed, as context for the next chunk
+
+	// Every recording gets its own context. Cancelling it kills whatever
+	// transcription is in flight and forbids any further typing, which is
+	// what makes Cancel mean cancel even when a chunk is half done.
+	sessCtx    context.Context
+	sessCancel context.CancelFunc
+	loopDone   chan struct{} // closed once the streaming loop has returned
+	limitTimer *time.Timer
+
+	// typeMu serialises everything that types. Without it a streamed chunk
+	// and the final tail can type at the same moment and interleave their
+	// keystrokes character by character.
+	typeMu sync.Mutex
 
 	// subscribers receive state changes, so a UI can show listening and
 	// transcribing without polling.
@@ -97,14 +111,31 @@ func New(engine stt.Engine, log *slog.Logger) (*Server, error) {
 		engine: engine, recorder: rec, injector: inj, log: log,
 		state: StateReady, subs: map[chan State]struct{}{},
 		streamCfg: DefaultStreamConfig(),
+		maxRecord: DefaultMaxRecord,
 	}, nil
 }
+
+// DefaultMaxRecord bounds a recording someone forgot to stop.
+//
+// Left running, dictation keeps typing into whatever has focus, and room noise
+// that clears the silence threshold invites Whisper to invent phrases ("Thank
+// you for watching."). Five minutes is far longer than anyone dictates in one
+// breath and far shorter than a forgotten microphone does damage.
+const DefaultMaxRecord = 5 * time.Minute
 
 // SetStreaming enables incremental transcription.
 func (s *Server) SetStreaming(c StreamConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.streamCfg = c
+}
+
+// SetMaxRecord limits how long one recording may run before it is stopped and
+// typed as though the user had stopped it. Zero removes the limit.
+func (s *Server) SetMaxRecord(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxRecord = d
 }
 
 // State returns the current state.
@@ -118,7 +149,10 @@ func (s *Server) setState(st State) {
 	s.mu.Lock()
 	s.state = st
 	s.mu.Unlock()
+	s.notify(st)
+}
 
+func (s *Server) notify(st State) {
 	s.subsMu.Lock()
 	for ch := range s.subs {
 		select {
@@ -129,6 +163,21 @@ func (s *Server) setState(st State) {
 	s.subsMu.Unlock()
 }
 
+// typeText types text unless the recording it belongs to has been cancelled.
+// It reports whether anything was typed.
+//
+// The check and the typing happen under typeMu, and Cancel takes typeMu after
+// cancelling, so once Cancel returns nothing more from that recording can be
+// typed.
+func (s *Server) typeText(ctx context.Context, text string) (bool, error) {
+	s.typeMu.Lock()
+	defer s.typeMu.Unlock()
+	if ctx.Err() != nil {
+		return false, nil
+	}
+	return true, s.injector.Type(text)
+}
+
 // Start begins recording.
 func (s *Server) Start() error {
 	s.mu.Lock()
@@ -137,10 +186,15 @@ func (s *Server) Start() error {
 		s.mu.Unlock()
 		return fmt.Errorf("busy: %s", st)
 	}
+	// Claim the state now, so two presses in quick succession cannot both
+	// start a recorder.
+	s.state = StateListening
+	cfg, limit := s.streamCfg, s.maxRecord
 	s.mu.Unlock()
 
 	dir, err := os.MkdirTemp("", "vox-")
 	if err != nil {
+		s.setState(StateReady)
 		return err
 	}
 	path := filepath.Join(dir, "speech.wav")
@@ -148,26 +202,37 @@ func (s *Server) Start() error {
 	sess, err := audio.Start(s.recorder, path)
 	if err != nil {
 		os.RemoveAll(dir)
+		s.setState(StateReady)
 		return err
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var done, loopDone chan struct{}
+	var reader *audio.Reader
+	if cfg.Enabled {
+		done, loopDone = make(chan struct{}), make(chan struct{})
+		reader = audio.NewReader(path)
+	}
+
 	s.mu.Lock()
 	s.session, s.audioIn = sess, path
+	s.sessCtx, s.sessCancel = ctx, cancel
 	s.streamedAny = false
 	s.streamPrior = ""
-	s.streamDone = nil
-	s.streamRead = nil
-	if s.streamCfg.Enabled {
-		s.streamDone = make(chan struct{})
-		s.streamRead = audio.NewReader(path)
+	s.streamDone, s.streamRead, s.loopDone = done, reader, loopDone
+	if limit > 0 {
+		s.limitTimer = time.AfterFunc(limit, func() { s.limitReached(sess, limit) })
 	}
-	done, streaming := s.streamDone, s.streamCfg.Enabled
 	s.mu.Unlock()
 
-	s.setState(StateListening)
-	if streaming {
+	s.notify(StateListening)
+	if cfg.Enabled {
 		// Text appears while you speak, so the wait at the end is only for
 		// whatever was said since the last chunk rather than the whole thing.
-		go s.streamLoopWith(context.Background(), path, done)
+		go func() {
+			defer close(loopDone)
+			s.streamLoopShared(ctx, reader, path, done)
+		}()
 		s.log.Info("listening (streaming)")
 	} else {
 		s.log.Info("listening")
@@ -175,47 +240,62 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// streamLoopWith shares the reader with Stop, so the two never transcribe the
-// same audio and no words are typed twice.
-func (s *Server) streamLoopWith(ctx context.Context, path string, done <-chan struct{}) {
-	s.mu.Lock()
-	r := s.streamRead
-	s.mu.Unlock()
-	if r == nil {
-		return
+// limitReached stops a recording that has run for the maximum length. It is
+// tied to the recording that set the timer, so a late timer can never stop a
+// newer one.
+func (s *Server) limitReached(sess *audio.Session, limit time.Duration) {
+	s.log.Warn("recording limit reached; stopping", "limit", limit)
+	if _, err := s.stop(context.Background(), sess); err != nil {
+		s.log.Warn("stopping at the recording limit", "err", err)
 	}
-	s.streamLoopShared(ctx, r, path, done)
 }
 
 // Stop ends recording, transcribes, and types the result.
 func (s *Server) Stop(ctx context.Context) (string, error) {
+	return s.stop(ctx, nil)
+}
+
+// stop ends the given recording, or whichever is running when want is nil.
+func (s *Server) stop(ctx context.Context, want *audio.Session) (string, error) {
 	s.mu.Lock()
-	if s.state != StateListening {
+	if s.state != StateListening || (want != nil && s.session != want) {
 		st := s.state
 		s.mu.Unlock()
 		return "", fmt.Errorf("not listening: %s", st)
 	}
 	sess, path := s.session, s.audioIn
+	done, reader, loopDone := s.streamDone, s.streamRead, s.loopDone
+	sessCtx := s.sessCtx
+	s.streamDone = nil
+	if s.limitTimer != nil {
+		s.limitTimer.Stop()
+	}
+	// Transcribing from here on, claimed under the lock so that a second
+	// stop (a double press, or the recording limit) is refused.
+	s.state = StateTranscribing
 	s.mu.Unlock()
+	s.notify(StateTranscribing)
 
 	defer os.RemoveAll(filepath.Dir(path))
 
-	// Stop the streaming loop before reading the tail, so both never
-	// transcribe the same audio.
-	s.mu.Lock()
-	done, reader, streamed := s.streamDone, s.streamRead, s.streamedAny
-	s.streamDone = nil
-	s.mu.Unlock()
 	if done != nil {
 		close(done)
 	}
-
 	if err := sess.Stop(); err != nil {
-		s.reset()
+		s.reset(sess)
 		return "", err
 	}
-	s.setState(StateTranscribing)
 	s.log.Info("transcribing", "engine", s.engine.Name())
+
+	// A chunk may still be transcribing. Let it finish and be typed before
+	// the tail is touched: the tail is later speech, and typing it first
+	// would put the end of what you said before its middle.
+	if loopDone != nil {
+		<-loopDone
+	}
+	if sessCtx.Err() != nil {
+		return "", nil // cancelled while the last chunk finished
+	}
 
 	// When streaming, only the audio since the last chunk is left. That is the
 	// whole point: the wait at the end is a second or two rather than the
@@ -224,8 +304,11 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 	if reader != nil {
 		tail, ok := s.remainder(reader, filepath.Dir(path))
 		if !ok {
+			s.mu.Lock()
+			streamed := s.streamedAny
+			s.mu.Unlock()
 			s.log.Info("nothing left to transcribe", "streamed", streamed)
-			s.reset()
+			s.reset(sess)
 			return "", nil
 		}
 		source = tail
@@ -235,10 +318,18 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 	prior := s.streamPrior
 	s.mu.Unlock()
 
+	// Cancel must reach this transcription too, not only the caller's ctx.
+	tctx, stopT := context.WithCancel(ctx)
+	defer stopT()
+	defer context.AfterFunc(sessCtx, stopT)()
+
 	start := time.Now()
-	text, err := s.engine.TranscribeWithContext(ctx, source, prior)
+	text, err := s.engine.TranscribeWithContext(tctx, source, prior)
+	if sessCtx.Err() != nil {
+		return "", nil // cancelled; Cancel has already reset
+	}
 	if err != nil {
-		s.reset()
+		s.reset(sess)
 		return "", err
 	}
 	s.log.Info("transcribed", "took", time.Since(start), "chars", len(text))
@@ -253,12 +344,12 @@ func (s *Server) Stop(ctx context.Context) (string, error) {
 		if reader != nil {
 			out = joinChunk(prior, text)
 		}
-		if err := s.injector.Type(out); err != nil {
-			s.reset()
+		if _, err := s.typeText(sessCtx, out); err != nil {
+			s.reset(sess)
 			return text, fmt.Errorf("typing the transcript: %w", err)
 		}
 	}
-	s.reset()
+	s.reset(sess)
 	return text, nil
 }
 
@@ -267,31 +358,66 @@ func (s *Server) Key(name string) error {
 	if name == "" {
 		return fmt.Errorf("no key named")
 	}
+	s.typeMu.Lock()
+	defer s.typeMu.Unlock()
 	return s.injector.Key(name)
 }
 
 // Cancel abandons a recording without transcribing.
+//
+// It also abandons work already under way: a chunk being transcribed is
+// killed, and nothing from this recording is typed after Cancel returns.
 func (s *Server) Cancel() error {
 	s.mu.Lock()
 	sess, path := s.session, s.audioIn
+	cancel, done, loopDone := s.sessCancel, s.streamDone, s.loopDone
+	s.streamDone = nil
 	s.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		close(done)
+	}
 	if sess != nil {
 		_ = sess.Stop()
 	}
+	if loopDone != nil {
+		<-loopDone
+	}
+	// Wait out a chunk that was already mid-keystroke when cancel landed.
+	s.typeMu.Lock()
+	s.typeMu.Unlock() //nolint:staticcheck // a barrier, not a critical section
 	if path != "" {
 		os.RemoveAll(filepath.Dir(path))
 	}
-	s.reset()
+	s.reset(sess)
 	s.log.Info("cancelled")
 	return nil
 }
 
-func (s *Server) reset() {
+// reset ends a recording and returns to ready. It does nothing if a newer
+// recording has already replaced sess, so a late reset from an old recording
+// cannot end the current one. A nil sess resets whatever is there.
+func (s *Server) reset(sess *audio.Session) {
 	s.mu.Lock()
+	if sess != nil && s.session != sess {
+		s.mu.Unlock()
+		return
+	}
+	if s.sessCancel != nil {
+		s.sessCancel()
+	}
+	if s.limitTimer != nil {
+		s.limitTimer.Stop()
+	}
 	s.session, s.audioIn = nil, ""
+	s.sessCtx, s.sessCancel = nil, nil
+	s.streamDone, s.streamRead, s.loopDone, s.limitTimer = nil, nil, nil, nil
+	s.state = StateReady
 	s.mu.Unlock()
-	s.setState(StateReady)
+	s.notify(StateReady)
 }
 
 // Toggle starts or stops, which is what a single button needs.
@@ -373,8 +499,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		case "state":
 			fmt.Fprintf(conn, "ok %s\n", s.State())
 		case "info":
-			fmt.Fprintf(conn, "ok engine=%s recorder=%s injector=%s\n",
-				s.engine.Name(), s.recorder.Name, s.injector.Name())
+			s.mu.Lock()
+			limit := s.maxRecord
+			s.mu.Unlock()
+			fmt.Fprintf(conn, "ok engine=%s recorder=%s injector=%s max_record=%s\n",
+				s.engine.Name(), s.recorder.Name, s.injector.Name(), limit)
 		case "subscribe":
 			s.stream(ctx, conn)
 			return
