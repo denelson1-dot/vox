@@ -5,3 +5,6 @@
 /dist/
 *.test
 /.forge
+
+# Python bytecode, from importing the wrapper scripts to test them
+__pycache__/
