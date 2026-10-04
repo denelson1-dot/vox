@@ -23,9 +23,11 @@ const (
 	defaultMaxChunk     = 14.0 // force a cut even with no pause to be found
 )
 
-// pollInterval is how often the loop looks for a chunk's worth of audio. A
-// variable only so tests need not wait out real dictation timings.
-var pollInterval = 900 * time.Millisecond
+// pollInterval is how often the loop looks for a chunk's worth of audio.
+// Each look reads only what is new since the last chunk, so looking often is
+// cheap, and every interval is time a ready chunk can sit waiting before it is
+// transcribed. A variable only so tests need not wait out real timings.
+var pollInterval = 250 * time.Millisecond
 
 // StreamConfig tunes incremental transcription.
 type StreamConfig struct {
@@ -129,6 +131,10 @@ func (s *Server) streamLoopShared(ctx context.Context, reader *audio.Reader, pat
 				continue
 			}
 			text = cleanChunk(text)
+			if isPhantom(text) {
+				s.log.Info("dropped a phrase Whisper invents from noise", "chars", len(text))
+				continue
+			}
 			if text == "" {
 				continue
 			}

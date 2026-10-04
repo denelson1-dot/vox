@@ -86,8 +86,8 @@ Measured on an i5-8250U, transcribing a 22-second utterance:
 | Model | Decoding | Speed | |
 |---|---|---|---|
 | `base.en` | greedy (`beam=1`) | 20x realtime | fast and noticeably worse |
-| `base.en` | `beam=5`, all cores | 10x realtime | **default** |
-| `small.en` | `beam=5`, all cores | 4x realtime | better; still imperceptible for dictation |
+| `base.en` | `beam=5` | 10x realtime | **default** |
+| `small.en` | `beam=5` | 4x realtime | better; still imperceptible for dictation |
 
 `beam_size=5` is faster-whisper's own default and cut word error rate by about
 a fifth in testing against greedy decoding. Running 10x faster than realtime
@@ -107,6 +107,28 @@ transcribed espeak output perfectly, because synthetic speech is far more
 regular than the human speech these models are trained on. Only the
 same-model beam comparison is a real accuracy result. Judge models with your
 own voice; nothing else generalises.
+
+### Latency
+
+What you wait for is a chunk's fixed cost, not its length: Whisper pads every
+input to a thirty-second window, so two seconds of speech take nearly as long
+as six. On the i5-8250U above, `base.en`:
+
+| | per chunk, and after tapping stop |
+|---|---|
+| one process per chunk (vox before serving) | 2.2 s |
+| model kept loaded, physical cores only | **0.75 s** |
+
+Two things make the difference. vox keeps the model loaded in one
+long-lived process (`vox-faster-whisper --serve`), started and warmed when the
+service starts, instead of paying Python's imports and a model load -- well
+over a second -- on every chunk. That costs about 240 MB of memory for as long
+as the service runs. And it uses one thread per physical core: Whisper's
+arithmetic saturates a core, so hyperthreads only contend, and 4 threads beat
+8 on a 4-core laptop. Override with `VOX_WHISPER_THREADS`.
+
+If the engine cannot serve (an engine without a serve mode, or an older
+wrapper), vox says so in its log and starts a process per chunk as before.
 
 ### Already have faster-whisper?
 

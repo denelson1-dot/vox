@@ -15,6 +15,7 @@ package stt
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -54,6 +55,11 @@ type Profile struct {
 	// text and must never be able to become syntax.
 	Command []string
 
+	// Serve, when set, runs the engine as one long-lived process that keeps
+	// its model loaded and answers requests over stdin and stdout (see
+	// worker.go). Command is still used if serving turns out not to work.
+	Serve []string
+
 	// Model is a path or a bare name resolved under the model directory.
 	Model string
 
@@ -78,6 +84,7 @@ func BuiltinProfiles() []Profile {
 		{
 			Name:    "faster-whisper",
 			Command: []string{"vox-faster-whisper", "{model}", "{audio}"},
+			Serve:   []string{"vox-faster-whisper", "--serve", "{model}"},
 			Model:   "base.en",
 			Timeout: 60 * time.Second,
 			Notes:   "needs the faster-whisper Python package; vox ships a small wrapper script",
@@ -127,14 +134,45 @@ func ModelDir() string {
 }
 
 // Command is an Engine driven by an external program.
-type Command struct{ p Profile }
+type Command struct {
+	p Profile
+	w *worker // nil unless the profile can serve
+}
 
 // New returns an Engine for a profile.
 func New(p Profile) *Command {
 	if p.Timeout <= 0 {
 		p.Timeout = 60 * time.Second
 	}
-	return &Command{p: p}
+	c := &Command{p: p}
+	if len(p.Serve) > 0 {
+		argv := make([]string, len(p.Serve))
+		for i, a := range p.Serve {
+			argv[i] = strings.ReplaceAll(a, "{model}", resolveModel(p.Model))
+		}
+		c.w = &worker{argv: argv, timeout: p.Timeout}
+	}
+	return c
+}
+
+// Warm loads the model now, so the first thing said after the service starts
+// is not also the one that waits for it. It reports whether the engine is
+// being served; on false, err says why, and every request starts a process.
+func (c *Command) Warm() (served bool, err error) {
+	if c.w == nil {
+		return false, nil
+	}
+	if err := c.w.warm(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Close stops a served engine's process.
+func (c *Command) Close() {
+	if c.w != nil {
+		c.w.close()
+	}
 }
 
 // Find returns a built-in profile by name.
@@ -158,10 +196,15 @@ func ProfileNames() []string {
 }
 
 // Detect returns the first built-in profile whose command exists and whose
-// model is present, so a fresh install usually needs no configuration.
-func Detect() (*Command, error) {
+// model is present, so a fresh install usually needs no configuration. A
+// non-empty model replaces each profile's default, so that choosing a model
+// does not also require naming the engine.
+func Detect(model string) (*Command, error) {
 	var reasons []string
 	for _, p := range BuiltinProfiles() {
+		if model != "" {
+			p.Model = model
+		}
 		c := New(p)
 		if err := c.Check(); err != nil {
 			reasons = append(reasons, "  "+p.Name+": "+err.Error())
@@ -216,6 +259,19 @@ func (c *Command) Transcribe(ctx context.Context, audioPath string) (string, err
 
 // TranscribeWithContext passes preceding text to the engine as a prompt.
 func (c *Command) TranscribeWithContext(ctx context.Context, audioPath, prior string) (string, error) {
+	if c.w != nil {
+		text, err := c.w.transcribe(ctx, audioPath, lastWords(prior, 200))
+		if !errors.Is(err, errNoServe) {
+			if err != nil {
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				return "", fmt.Errorf("%s: %w", c.p.Name, err)
+			}
+			return clean(text, c.p.StripPrefixes), nil
+		}
+		// Serving does not work here; one process per request still does.
+	}
 	cctx, cancel := context.WithTimeout(ctx, c.p.Timeout)
 	defer cancel()
 

@@ -94,6 +94,27 @@ func lowerFirstIfPlain(s string) string {
 	return strings.ToLower(s[:1]) + s[1:]
 }
 
+// phantoms are what Whisper writes for audio with no speech in it: a key
+// click, a breath, a chair. They come from its training data -- subtitles,
+// where the end of a video is silence captioned "Thanks for watching" -- and
+// it reaches for them whenever it is handed sound but no words. A chunk that
+// is nothing but one of these is dropped. Each is something nobody dictates
+// as an entire utterance; a real sentence that merely contains one is left
+// alone.
+var phantoms = map[string]bool{
+	"you": true, "thanks for watching": true, "thank you for watching": true,
+	"thanks for watching and see you next time": true,
+	"please subscribe":                          true, "subscribe to my channel": true,
+	"thank you for watching and see you next time": true,
+}
+
+// isPhantom reports whether text is only a phrase Whisper invents from noise.
+func isPhantom(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	t = strings.Trim(t, ".,!?;:…\"' ")
+	return phantoms[t]
+}
+
 // sentencePause is the shortest pause at a chunk boundary that is taken as
 // the end of a sentence.
 //

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe one audio file with faster-whisper, for vox.
+"""Transcribe audio with faster-whisper, for vox.
 
 vox drives every speech engine as an external command, so adding an engine
 means writing a script like this rather than changing vox. This one is shipped
@@ -9,9 +9,11 @@ The interpreter is resolved at runtime rather than hardcoded in the shebang:
 a shebang pointing at one person's virtualenv is exactly the kind of thing
 that makes a tool unshareable.
 
-Usage:  vox-faster-whisper MODEL AUDIO
+Usage:  vox-faster-whisper MODEL AUDIO     transcribe one file and exit
+        vox-faster-whisper --serve MODEL   keep the model loaded; see serve()
 """
 
+import json
 import os
 import sys
 
@@ -39,15 +41,35 @@ def find_interpreter():
     return None
 
 
-def main():
-    if len(sys.argv) != 3:
-        sys.exit("usage: vox-faster-whisper MODEL AUDIO")
-    model_arg, audio = sys.argv[1], sys.argv[2]
+def physical_cores():
+    """Physical cores, not hardware threads.
 
-    interp = find_interpreter()
-    if interp is not None:
-        os.execv(interp, [interp, os.path.abspath(__file__), model_arg, audio])
+    Whisper's matrix work saturates a core's execution units, so a second
+    hyperthread on the same core only contends for them: on a 4-core, 8-thread
+    laptop, 4 threads transcribed a chunk about a fifth faster than 8.
+    """
+    cores = set()
+    try:
+        with open("/proc/cpuinfo") as f:
+            phys = core = None
+            for line in f:
+                key, _, value = line.partition(":")
+                key, value = key.strip(), value.strip()
+                if key == "physical id":
+                    phys = value
+                elif key == "core id":
+                    core = value
+                elif not key and core is not None:
+                    cores.add((phys, core))
+                    phys = core = None
+            if core is not None:
+                cores.add((phys, core))
+    except OSError:
+        pass
+    return len(cores) or os.cpu_count() or 4
 
+
+def load_model(model_arg):
     from faster_whisper import WhisperModel
 
     # A bare name is a model to fetch or find in the shared cache; a path is a
@@ -63,39 +85,36 @@ def main():
     if os.path.isdir(model_arg):
         name, cache = model_arg, None
 
-    # Default to every core. Dictation is bursty and interactive: the machine
-    # is doing nothing else while it waits for you, so leaving cores idle buys
-    # nothing and costs latency you can spend on accuracy instead.
     kwargs = dict(
         device=os.environ.get("VOX_WHISPER_DEVICE", "cpu"),
         compute_type=os.environ.get("VOX_WHISPER_COMPUTE", "int8"),
-        cpu_threads=int(os.environ.get("VOX_WHISPER_THREADS") or os.cpu_count() or 4),
+        cpu_threads=int(os.environ.get("VOX_WHISPER_THREADS") or physical_cores()),
     )
     if cache:
         kwargs["download_root"] = cache
     # Offline by default: dictation should not quietly reach the network.
     if os.environ.get("VOX_WHISPER_ALLOW_DOWNLOAD") != "1":
         kwargs["local_files_only"] = True
+    return WhisperModel(name, **kwargs), kwargs["cpu_threads"]
 
-    model = WhisperModel(name, **kwargs)
+
+def transcribe(model, audio, prompt):
     # beam_size 5 is faster-whisper's own default and measurably more accurate
     # than greedy decoding: on this machine it cut word error rate by about a
     # fifth while still transcribing ten times faster than realtime. Greedy
     # decoding is the right choice only when latency actually hurts, and for
     # dictation it does not.
     beam = int(os.environ.get("VOX_WHISPER_BEAM", "5"))
-
-    # What was transcribed just before this chunk, when streaming. Without it
-    # the model treats every chunk as a fresh utterance: it recapitalises, it
-    # re-punctuates, and it writes an ellipsis where the audio was cut.
-    prompt = os.environ.get("VOX_PROMPT") or None
-
     segments, _ = model.transcribe(
         audio,
         language=os.environ.get("VOX_WHISPER_LANGUAGE") or None,
         beam_size=beam,
         best_of=beam,
-        initial_prompt=prompt,
+        # What was transcribed just before this chunk, when streaming. Without
+        # it the model treats every chunk as a fresh utterance: it
+        # recapitalises, it re-punctuates, and it writes an ellipsis where the
+        # audio was cut.
+        initial_prompt=prompt or None,
         vad_filter=True,
         # Off deliberately. Conditioning on previous text improves long-form
         # transcription but can send the model into repetition loops, and a
@@ -103,7 +122,67 @@ def main():
         # gain.
         condition_on_previous_text=False,
     )
-    print("".join(s.text for s in segments).strip())
+    return "".join(s.text for s in segments).strip()
+
+
+def serve(model_arg):
+    """Keep the model loaded and transcribe requests until stdin closes.
+
+    Loading the model costs over a second and Python's imports a third of one
+    more, on every chunk, when each call is a fresh process. That was more than
+    half of every chunk's wait. Served, it is paid once, when vox starts.
+
+    One JSON object per line each way:
+      in:   {"audio": "/path/chunk.wav", "prompt": "what came before"}
+      out:  {"text": "..."}  or  {"error": "..."}
+    and once, when the model is loaded and warm:
+      out:  {"ready": true, "threads": 4}
+
+    vox kills the process to abandon a request (there is no interrupting one
+    mid-inference), so nothing here needs to handle cancellation.
+    """
+    out = sys.stdout
+    sys.stdout = sys.stderr  # stray prints from libraries must not corrupt replies
+
+    def reply(obj):
+        out.write(json.dumps(obj) + "\n")
+        out.flush()
+
+    import numpy as np
+
+    model, threads = load_model(model_arg)
+    # The first inference pays one-off setup costs; pay them now, not on the
+    # first thing someone says.
+    transcribe(model, np.zeros(16000, dtype=np.float32), None)
+    reply({"ready": True, "threads": threads})
+
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            req = json.loads(line)
+            reply({"text": transcribe(model, req["audio"], req.get("prompt"))})
+        except Exception as e:  # one bad request must not take the model down
+            reply({"error": f"{type(e).__name__}: {e}"})
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) != 2:
+        sys.exit("usage: vox-faster-whisper MODEL AUDIO\n"
+                 "       vox-faster-whisper --serve MODEL")
+
+    interp = find_interpreter()
+    if interp is not None:
+        os.execv(interp, [interp, os.path.abspath(__file__), *args])
+
+    if args[0] == "--serve":
+        serve(args[1])
+        return
+
+    model_arg, audio = args
+    model, _ = load_model(model_arg)
+    print(transcribe(model, audio, os.environ.get("VOX_PROMPT")))
 
 
 if __name__ == "__main__":

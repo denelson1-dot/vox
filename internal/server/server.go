@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/denelson1-dot/vox/internal/audio"
@@ -341,6 +342,12 @@ func (s *Server) stop(ctx context.Context, want *audio.Session) (string, error) 
 		// boundary artefacts.
 		text = cleanChunk(text)
 	}
+	// The tail is the likeliest place for one: it ends with the click of
+	// the key that stopped the recording.
+	if isPhantom(text) {
+		s.log.Info("dropped a phrase Whisper invents from noise", "chars", len(text))
+		text = ""
+	}
 	if text != "" {
 		out := text + " "
 		if reader != nil {
@@ -439,6 +446,8 @@ func (s *Server) Toggle(ctx context.Context) (string, error) {
 
 // Serve accepts clients until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context, socket string) error {
+	s.removeStaleRecordings()
+
 	// A stale socket from an unclean exit would otherwise block startup
 	// forever with a confusing "address already in use".
 	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
@@ -557,4 +566,39 @@ func reply(conn net.Conn, err error) {
 }
 
 // Close releases the injector.
-func (s *Server) Close() error { return s.injector.Close() }
+//
+// A recording still running is cancelled first, so its audio is deleted
+// rather than left behind in the temp directory.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	active := s.session != nil
+	s.mu.Unlock()
+	if active {
+		s.Cancel()
+	}
+	return s.injector.Close()
+}
+
+// removeStaleRecordings deletes recordings left by a previous run that died
+// mid-dictation (a crash, a kill, a power cut). They hold whatever the
+// microphone heard, and nothing will ever read them. Called before serving,
+// when no recording of this run can exist yet.
+func (s *Server) removeStaleRecordings() {
+	dirs, _ := filepath.Glob(filepath.Join(os.TempDir(), "vox-*"))
+	removed := 0
+	for _, d := range dirs {
+		info, err := os.Lstat(d)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() {
+			continue // someone else's, or not knowably ours
+		}
+		if os.RemoveAll(d) == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		s.log.Info("removed recordings left by an earlier run", "count", removed)
+	}
+}

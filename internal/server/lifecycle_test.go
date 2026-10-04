@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -301,5 +302,47 @@ func TestConcurrentStartsStartOnce(t *testing.T) {
 	wg.Wait()
 	if n := ok.Load(); n != 1 {
 		t.Errorf("%d starts succeeded, want 1", n)
+	}
+}
+
+// Shutting down mid-recording must not leave the audio behind.
+func TestCloseDeletesAnActiveRecording(t *testing.T) {
+	e := &fakeEngine{delay: func(int) time.Duration { return 0 }}
+	s, kb := newTestServer(t, e, true)
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	dir := filepath.Dir(s.audioIn)
+	s.mu.Unlock()
+
+	s.Close()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("recording directory %s survived shutdown", dir)
+	}
+	if kb.text() != "" {
+		t.Errorf("shutdown typed %q", kb.text())
+	}
+}
+
+// A recording left by a run that died is deleted at the next start; other
+// files in the temp directory are not touched.
+func TestStaleRecordingsAreRemoved(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	stale := filepath.Join(tmp, "vox-123")
+	os.Mkdir(stale, 0o700)
+	os.WriteFile(filepath.Join(stale, "speech.wav"), []byte("audio"), 0o600)
+	other := filepath.Join(tmp, "voxels")
+	os.Mkdir(other, 0o700)
+
+	s, _ := newTestServer(t, &fakeEngine{delay: func(int) time.Duration { return 0 }}, false)
+	s.removeStaleRecordings()
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("stale recording was not removed")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Error("removed a directory that was not a vox recording")
 	}
 }

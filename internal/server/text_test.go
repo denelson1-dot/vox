@@ -101,3 +101,26 @@ func TestSoftenEnd(t *testing.T) {
 		}
 	}
 }
+
+// Whisper captions noise with phrases from video subtitles. A chunk that is
+// only one of them is noise; a sentence containing one is speech.
+func TestIsPhantom(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"You", true},
+		{" you. ", true},
+		{"Thanks for watching!", true},
+		{"Thank you for watching.", true},
+		{"Please subscribe.", true},
+		{"Thank you.", false}, // people do say this
+		{"you should try it", false},
+		{"Thanks for watching the kids last night.", false},
+		{"", false},
+	} {
+		if got := isPhantom(tc.in); got != tc.want {
+			t.Errorf("isPhantom(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

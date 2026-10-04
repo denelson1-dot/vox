@@ -22,6 +22,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/denelson1-dot/vox/internal/audio"
 	"github.com/denelson1-dot/vox/internal/inject"
@@ -131,7 +132,7 @@ func daemon(args []string, stderr io.Writer) error {
 		}
 		engine = c
 	} else {
-		c, err := stt.Detect()
+		c, err := stt.Detect(*model)
 		if err != nil {
 			return err
 		}
@@ -143,6 +144,26 @@ func daemon(args []string, stderr io.Writer) error {
 		return err
 	}
 	defer srv.Close()
+
+	// Load the model now, in the background: the socket is up at once, and a
+	// request that arrives first simply waits for the load it would have paid
+	// for anyway.
+	if w, ok := engine.(interface {
+		Warm() (bool, error)
+		Close()
+	}); ok {
+		defer w.Close()
+		go func() {
+			start := time.Now()
+			served, err := w.Warm()
+			switch {
+			case served:
+				log.Info("model loaded and kept in memory", "took", time.Since(start).Round(time.Millisecond))
+			case err != nil:
+				log.Warn("cannot keep the model loaded; starting the engine for every request", "err", err)
+			}
+		}()
+	}
 
 	srv.SetStreaming(server.StreamConfig{
 		Enabled: *streaming, ChunkSeconds: *chunk, MaxSeconds: *chunk * 2.3,
